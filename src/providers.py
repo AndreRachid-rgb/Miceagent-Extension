@@ -37,6 +37,7 @@ class ChatMessage:
 @dataclass
 class ChatResult:
     content: str | None = None
+    thinking: str | None = None
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
     finish_reason: str = "stop"
     model: str = ""
@@ -136,8 +137,12 @@ class OpenAICompatibleProvider:
         choice = data["choices"][0]
         message = choice.get("message", {})
 
+        # Suporte a reasoning_content nativo (DeepSeek R1, OpenRouter, etc.)
+        reasoning = message.get("reasoning_content")
+
         return ChatResult(
             content=message.get("content"),
+            thinking=reasoning,
             tool_calls=message.get("tool_calls", []),
             finish_reason=choice.get("finish_reason", "stop"),
             model=data.get("model", model),
