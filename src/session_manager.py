@@ -31,6 +31,7 @@ class Session:
     status: str = "active"  # active | paused | completed | failed
     snapshots: list[dict[str, Any]] = field(default_factory=list)
     events: list[ActionEvent] = field(default_factory=list)
+    attachments: list[dict[str, Any]] = field(default_factory=list)
     step_count: int = 0
 
 
@@ -39,12 +40,13 @@ class SessionManager:
         self.sessions: dict[str, Session] = {}
         self.active_session_id: str | None = None
 
-    def create_session(self, goal: str) -> Session:
+    def create_session(self, goal: str, attachments: list[dict[str, Any]] | None = None) -> Session:
         session_id = f"sess_{uuid.uuid4().hex[:12]}"
         session = Session(
             session_id=session_id,
             goal=goal,
             created_at=datetime.now(timezone.utc).isoformat(),
+            attachments=attachments or [],
         )
         self.sessions[session_id] = session
         self.active_session_id = session_id
