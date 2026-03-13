@@ -30,7 +30,7 @@ class ProviderStatus:
 @dataclass
 class ChatMessage:
     role: str  # system | user | assistant | tool
-    content: str
+    content: Any
     tool_call_id: str | None = None
     tool_calls: list[dict[str, Any]] | None = None
 
@@ -107,17 +107,31 @@ class OpenAICompatibleProvider:
         tools: list[dict[str, Any]] | None = None,
         stream: bool = False,
     ) -> ChatResult:
-        payload: dict[str, Any] = {
-            "model": model,
-            "messages": [{"role": m.role, "content": m.content} for m in messages],
-        }
-        if tools:
-            payload["tools"] = tools
-            payload["tool_choice"] = "auto"
+        payload = self._build_payload(messages=messages, model=model, tools=tools)
 
-        resp = await self._client.post("/v1/chat/completions", json=payload)
-        resp.raise_for_status()
-        data = resp.json()
+        try:
+            resp = await self._client.post("/v1/chat/completions", json=payload)
+            resp.raise_for_status()
+            data = resp.json()
+        except httpx.HTTPStatusError as err:
+            if self._contains_multimodal_messages(messages):
+                # Fallback: model rejected multimodal → retry as text-only (with tools)
+                fallback_payload = self._build_payload(
+                    messages=self._to_text_only_messages(messages),
+                    model=model,
+                    tools=tools,
+                )
+                fallback_resp = await self._client.post("/v1/chat/completions", json=fallback_payload)
+                fallback_resp.raise_for_status()
+                data = fallback_resp.json()
+            elif tools:
+                # Fallback: model rejected tool-calling format → retry without tools
+                notool_payload = self._build_payload(messages=messages, model=model, tools=None)
+                notool_resp = await self._client.post("/v1/chat/completions", json=notool_payload)
+                notool_resp.raise_for_status()
+                data = notool_resp.json()
+            else:
+                raise err
 
         choice = data["choices"][0]
         message = choice.get("message", {})
@@ -130,6 +144,75 @@ class OpenAICompatibleProvider:
             usage=data.get("usage", {}),
             raw=data,
         )
+
+    def _build_payload(
+        self,
+        messages: list[ChatMessage],
+        model: str,
+        tools: list[dict[str, Any]] | None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "model": model,
+            "messages": [self._serialize_message(m) for m in messages],
+            "temperature": 0.35,
+            "top_p": 0.8,
+        }
+        if tools:
+            payload["tools"] = tools
+            payload["tool_choice"] = "auto"
+        return payload
+
+    def _serialize_message(self, m: ChatMessage) -> dict[str, Any]:
+        """Serialize a ChatMessage to the OpenAI API format, preserving all required fields."""
+        msg: dict[str, Any] = {"role": m.role, "content": m.content}
+        # Assistant messages may carry tool_calls; tool messages must carry tool_call_id
+        if m.tool_calls:
+            msg["tool_calls"] = m.tool_calls
+        if m.tool_call_id:
+            msg["tool_call_id"] = m.tool_call_id
+        return msg
+
+    def _contains_multimodal_messages(self, messages: list[ChatMessage]) -> bool:
+        for msg in messages:
+            if isinstance(msg.content, list):
+                return True
+        return False
+
+    def _to_text_only_messages(self, messages: list[ChatMessage]) -> list[ChatMessage]:
+        normalized: list[ChatMessage] = []
+        for msg in messages:
+            if isinstance(msg.content, str):
+                normalized.append(msg)
+                continue
+
+            if not isinstance(msg.content, list):
+                normalized.append(ChatMessage(role=msg.role, content=str(msg.content)))
+                continue
+
+            text_chunks: list[str] = []
+            for part in msg.content:
+                if not isinstance(part, dict):
+                    text_chunks.append(str(part))
+                    continue
+
+                part_type = part.get("type")
+                if part_type == "text":
+                    text_chunks.append(str(part.get("text", "")))
+                elif part_type == "image_url":
+                    text_chunks.append("[image attachment omitted in text-only fallback]")
+                else:
+                    text_chunks.append(f"[{part_type or 'unknown'} attachment omitted]")
+
+            normalized.append(
+                ChatMessage(
+                    role=msg.role,
+                    content="\n".join(chunk for chunk in text_chunks if chunk).strip(),
+                    tool_call_id=msg.tool_call_id,
+                    tool_calls=msg.tool_calls,
+                )
+            )
+
+        return normalized
 
 
 # ── LM Studio ──

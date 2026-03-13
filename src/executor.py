@@ -76,12 +76,14 @@ class ExecutorArbiter:
             correlation_id = session_manager.generate_correlation_id()
             session_manager.increment_step()
 
-            # Despachar para extensão
+            # Despachar para extensão — incluir lm_tool_call_id (id do LLM) para
+            # que o backend possa registrar corretamente o tool_result na memória.
             await self.send_to_extension({
                 "type": "EXECUTE_TOOL",
                 "tool": tool_name,
                 "args": tool_args,
                 "correlation_id": correlation_id,
+                "lm_tool_call_id": tool_call_id,
             })
 
             results.append({
