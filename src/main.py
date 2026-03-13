@@ -185,6 +185,7 @@ class ChatRequestMessage(BaseModel):
 
 class ChatRequest(BaseModel):
     messages: list[ChatRequestMessage]
+    attachments: list[str] = Field(default_factory=list)
 
 # ── REST Endpoints ──
 
@@ -244,6 +245,25 @@ async def send_chat(req: ChatRequest):
         raise HTTPException(status_code=503, detail="No provider configured.")
 
     messages_out = [ChatMessage(role=m.role, content=m.content) for m in req.messages]
+
+    # Resolve attachments and inject into the last user message as multimodal content
+    if req.attachments:
+        attachment_contexts = resolve_attachment_contexts(req.attachments)
+        if attachment_contexts and messages_out and messages_out[-1].role == "user":
+            last_text = messages_out[-1].content if isinstance(messages_out[-1].content, str) else ""
+            multimodal: list[dict] = []
+            if last_text:
+                multimodal.append({"type": "text", "text": last_text})
+            for att in attachment_contexts:
+                if att.get("image_data_url"):
+                    multimodal.append({"type": "image_url", "image_url": {"url": att["image_data_url"]}})
+                else:
+                    summary = f"Attachment: {att.get('filename', 'unknown')} ({att.get('media_type', '')})"
+                    excerpt = att.get("text_excerpt")
+                    if excerpt:
+                        summary += f"\nContent:\n{excerpt}"
+                    multimodal.append({"type": "text", "text": summary})
+            messages_out[-1] = ChatMessage(role="user", content=multimodal)
 
     try:
         result = await provider.chat(messages=messages_out, model=configured_model)
@@ -379,6 +399,7 @@ async def websocket_endpoint(ws: WebSocket):
             elif msg_type == "SNAPSHOT_RESULT":
                 payload = message.get("payload")
                 if payload:
+                    payload = sanitize_surrogates(payload)
                     session_manager.log_snapshot(payload)
                     logger.info(f"Snapshot received: {payload.get('top_url', '?')}")
 
@@ -581,6 +602,21 @@ def extract_thinking_content(content: str) -> str:
         return "\n\n".join(m.strip() for m in matches if m.strip())
     except re.error:
         return ""
+
+
+def sanitize_surrogates(obj: Any) -> Any:
+    """Remove lone surrogate characters from all string values in a JSON-like object.
+
+    Pages may contain emoji or malformed text with lone surrogates (e.g. \\ud83e)
+    that are not valid UTF-8 and cause encoding errors when serialised to JSON.
+    """
+    if isinstance(obj, str):
+        return obj.encode("utf-8", errors="replace").decode("utf-8")
+    if isinstance(obj, dict):
+        return {k: sanitize_surrogates(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [sanitize_surrogates(v) for v in obj]
+    return obj
 
 
 def sanitize_filename(filename: str) -> str:
