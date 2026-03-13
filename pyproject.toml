@@ -1,0 +1,23 @@
+[project]
+name = "miceagent-backend"
+version = "0.1.0"
+description = "Backend server for the miceagent browser agent — orchestration, planning and LLM integration."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.30.0",
+    "websockets>=13.0",
+    "pydantic>=2.10.0",
+    "httpx>=0.27.0",
+]
+
+[project.scripts]
+miceagent-server = "src.main:app"
+
+[tool.uv]
+dev-dependencies = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "httpx>=0.27.0",
+]
