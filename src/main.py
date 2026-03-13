@@ -26,18 +26,18 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 try:
-    from .providers import create_provider, ChatProvider
+    from .providers import create_provider, ChatProvider, ChatMessage
     from .planner import Planner
     from .executor import ExecutorArbiter
     from .session_manager import session_manager
 except ImportError:
     try:
-        from src.providers import create_provider, ChatProvider
+        from src.providers import create_provider, ChatProvider, ChatMessage
         from src.planner import Planner
         from src.executor import ExecutorArbiter
         from src.session_manager import session_manager
     except ModuleNotFoundError:
-        from providers import create_provider, ChatProvider  # type: ignore
+        from providers import create_provider, ChatProvider, ChatMessage  # type: ignore
         from planner import Planner  # type: ignore
         from executor import ExecutorArbiter  # type: ignore
         from session_manager import session_manager  # type: ignore
@@ -179,6 +179,13 @@ class ProviderConfig(BaseModel):
     base_url: str | None = None
     model: str = "default"
 
+class ChatRequestMessage(BaseModel):
+    role: str  # "user" | "assistant" | "system"
+    content: str
+
+class ChatRequest(BaseModel):
+    messages: list[ChatRequestMessage]
+
 # ── REST Endpoints ──
 
 @app.get("/health")
@@ -228,6 +235,34 @@ def configure_provider(config: ProviderConfig):
         return {"status": "configured", "provider": status.__dict__}
     except Exception as e:
         return {"status": "error", "error": str(e)}
+
+
+@app.post("/chat/send")
+async def send_chat(req: ChatRequest):
+    """Modo Chat puro — sem snapshot, sem tools, sem agent loop."""
+    if not provider:
+        raise HTTPException(status_code=503, detail="No provider configured.")
+
+    messages_out = [ChatMessage(role=m.role, content=m.content) for m in req.messages]
+
+    try:
+        result = await provider.chat(messages=messages_out, model=configured_model)
+
+        thinking_content = result.thinking or extract_thinking_content(result.content or "")
+        clean_content = strip_thinking_content(result.content or "")
+
+        return {
+            "status": "success",
+            "message": {
+                "role": "assistant",
+                "content": clean_content or "Sem resposta textual.",
+                "thinking": thinking_content,
+            },
+        }
+    except Exception as e:
+        logger.error(f"Chat send failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.post("/planner/start")
 async def start_planning(payload: AgentGoal):
@@ -432,7 +467,8 @@ async def run_agent_step(active_planner: Planner, snapshot: dict | None):
         result = await active_planner.think(snapshot)
 
         if result.content:
-            thinking_content = extract_thinking_content(result.content)
+            # Priorizar reasoning_content nativo da API; fallback para regex
+            thinking_content = result.thinking or extract_thinking_content(result.content)
             clean_content = strip_thinking_content(result.content)
             await manager.broadcast({
                 "type": "AI_RESPONSE",
@@ -525,21 +561,23 @@ def extract_action_hint(content: str) -> str:
 
 
 def strip_thinking_content(content: str) -> str:
-    """Remove blocos <think>...</think> para mostrar apenas a resposta final."""
+    """Remove blocos <think>...</think> para mostrar apenas a resposta final.
+    Suporta tags não fechadas (modelo cortou output)."""
     if not content:
         return ""
     try:
-        return re.sub(r"<think>.*?</think>", "", content, flags=re.IGNORECASE | re.DOTALL).strip()
+        return re.sub(r"<think>.*?(?:</think>|$)", "", content, flags=re.IGNORECASE | re.DOTALL).strip()
     except re.error:
         return content.strip()
 
 
 def extract_thinking_content(content: str) -> str:
-    """Extrai conteúdo de <think>...</think> para exibição em painel separado."""
+    """Extrai conteúdo de <think>...</think> para exibição em painel separado.
+    Suporta tags não fechadas (modelo cortou output)."""
     if not content:
         return ""
     try:
-        matches = re.findall(r"<think>(.*?)</think>", content, flags=re.IGNORECASE | re.DOTALL)
+        matches = re.findall(r"<think>(.*?)(?:</think>|$)", content, flags=re.IGNORECASE | re.DOTALL)
         return "\n\n".join(m.strip() for m in matches if m.strip())
     except re.error:
         return ""
