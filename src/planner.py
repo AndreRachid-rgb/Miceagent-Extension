@@ -177,6 +177,7 @@ class SessionMemory:
     completed_steps: list[str] = field(default_factory=list)
     filled_fields: dict[str, str] = field(default_factory=dict)
     notes: list[str] = field(default_factory=list)
+    attachments: list[dict[str, Any]] = field(default_factory=list)
 
 
 # ── Planner ──
@@ -188,17 +189,20 @@ class Planner:
         self.step_memory = StepMemory()
         self.session_memory = SessionMemory()
         self.message_history: list[ChatMessage] = []
+        self.attachments_sent = False
+        self.max_history_messages = 30
 
     def build_system_prompt(self) -> str:
         """Contexto sugerido §7.3."""
         return """You control a Firefox extension-based browser agent called miceagent.
 Use only the provided tools to interact with web pages.
-If the current state is stale or ambiguous, request a new snapshot using capture_snapshot.
 
 Rules:
 - Always refer to elements by their target_id from the latest snapshot.
-- After performing an action, you will receive a resnapshot automatically.
-- If you cannot find the expected element, scroll or request a new snapshot.
+- Prefer direct interaction tools (click_target, type_text, select_option) whenever a valid target is present.
+- Use scroll_page only to discover new targets outside the viewport.
+- Use capture_snapshot only when the state is genuinely stale, after navigation, or after uncertainty that cannot be resolved from current context.
+- Avoid repeated cycles of scroll_page + capture_snapshot when no new evidence appears.
 - When the task is complete, call the 'done' tool with a summary.
 - Be precise and methodical. Verify your actions produced the expected result.
 - Never hallucinate target_ids. Only use IDs from the provided snapshot."""
@@ -216,6 +220,9 @@ Rules:
 
         if self.step_memory.last_error:
             parts.append(f"## Last Error\n{self.step_memory.last_error}")
+
+        if self.session_memory.attachments:
+            parts.append("## Attachments\n" + self._summarize_attachments())
 
         if snapshot:
             snap_summary = self._summarize_snapshot(snapshot)
@@ -258,12 +265,45 @@ Rules:
 
         return "\n".join(lines)
 
+    def _summarize_attachments(self) -> str:
+        lines: list[str] = []
+        for item in self.session_memory.attachments:
+            name = item.get("filename", "unknown")
+            media_type = item.get("media_type", "application/octet-stream")
+            size = item.get("size", 0)
+            lines.append(f"- {name} ({media_type}, {size} bytes)")
+            excerpt = item.get("text_excerpt")
+            if excerpt:
+                lines.append(f"  excerpt: {excerpt[:200]}")
+        return "\n".join(lines)
+
     async def think(self, snapshot: dict | None) -> ChatResult:
         """Executa um passo de planejamento."""
         if not self.message_history:
             self.message_history.append(
                 ChatMessage(role="system", content=self.build_system_prompt())
             )
+
+        if self.session_memory.attachments and not self.attachments_sent:
+            multimodal_parts: list[dict[str, Any]] = [
+                {"type": "text", "text": f"Goal: {self.session_memory.goal}"}
+            ]
+            for attachment in self.session_memory.attachments:
+                image_data_url = attachment.get("image_data_url")
+                if image_data_url:
+                    multimodal_parts.append({
+                        "type": "image_url",
+                        "image_url": {"url": image_data_url},
+                    })
+                else:
+                    summary = f"Attachment: {attachment.get('filename', 'unknown')} ({attachment.get('media_type', 'application/octet-stream')})"
+                    excerpt = attachment.get("text_excerpt")
+                    if excerpt:
+                        summary += f"\nExcerpt:\n{excerpt[:500]}"
+                    multimodal_parts.append({"type": "text", "text": summary})
+
+            self.message_history.append(ChatMessage(role="user", content=multimodal_parts))
+            self.attachments_sent = True
 
         context = self.build_context_message(snapshot)
         self.message_history.append(
@@ -285,6 +325,8 @@ Rules:
             )
         )
 
+        self._trim_history()
+
         return result
 
     def record_tool_result(self, tool_call_id: str, result: dict):
@@ -296,11 +338,28 @@ Rules:
                 tool_call_id=tool_call_id,
             )
         )
+        self._trim_history()
 
-    def set_goal(self, goal: str):
+    def set_goal(self, goal: str, attachments: list[dict[str, Any]] | None = None):
         self.session_memory.goal = goal
+        self.session_memory.attachments = attachments or []
         self.step_memory.last_goal = goal
+        self.attachments_sent = False
         self.message_history.clear()  # reset para novo objetivo
 
     def record_step(self, description: str):
         self.session_memory.completed_steps.append(description)
+
+    def _trim_history(self):
+        if len(self.message_history) <= self.max_history_messages:
+            return
+
+        if not self.message_history:
+            return
+
+        first = self.message_history[0]
+        if first.role == "system":
+            tail = self.message_history[-(self.max_history_messages - 1):]
+            self.message_history = [first, *tail]
+        else:
+            self.message_history = self.message_history[-self.max_history_messages:]
