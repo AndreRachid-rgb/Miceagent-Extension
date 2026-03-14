@@ -2,7 +2,7 @@
 
 # Miceagent Extension
 <p align="center">
-  <img src="Asset/miceagent-logo.png" alt="MiceAgent" width="180" />
+  <img src="asset/miceagent-logo.png" alt="MiceAgent" width="180" />
 </p>
 
 
