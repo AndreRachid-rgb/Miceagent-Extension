@@ -11,7 +11,9 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import csv
 import hashlib
+import io
 import json
 import logging
 import mimetypes
@@ -54,10 +56,14 @@ DEFAULT_MODEL = "default"  # LM Studio auto-selects loaded model
 UPLOAD_DIR = Path(__file__).resolve().parents[1] / "uploads"
 MAX_UPLOAD_BYTES = 25 * 1024 * 1024
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
-MAX_INLINE_IMAGE_BYTES = 2 * 1024 * 1024
+MAX_INLINE_IMAGE_BYTES = 8 * 1024 * 1024
+MAX_UPLOAD_PREVIEW_IMAGE_BYTES = 512 * 1024
 MAX_ATTACHMENTS_PER_GOAL = 8
 ATTACHMENT_TTL_HOURS = 24
+CHAT_SESSION_TTL_HOURS = 12
 MAX_STORED_ATTACHMENTS = 400
+MAX_TEXT_EXCERPT_CHARS = 4000
+MAX_UPLOAD_PREVIEW_TEXT_CHARS = 800
 ALLOWED_MEDIA_TYPES = {
     "image/png",
     "image/jpeg",
@@ -69,6 +75,10 @@ ALLOWED_MEDIA_TYPES = {
     "application/json",
     "text/csv",
 }
+LLM_INLINE_NATIVE_IMAGE_MEDIA_TYPES = {
+    "image/png",
+    "image/jpeg",
+}
 
 
 class AttachmentRecord(TypedDict):
@@ -79,6 +89,11 @@ class AttachmentRecord(TypedDict):
     path: str
     sha256: str
     created_at: str
+
+
+class ChatSessionRecord(TypedDict):
+    attachment_ids: list[str]
+    updated_at: str
 
 # ── Connection Manager (P2 fix) ──
 
@@ -129,6 +144,7 @@ planner: Planner | None = None
 executor: ExecutorArbiter | None = None
 agent_loop_task: asyncio.Task | None = None
 uploaded_attachments: dict[str, AttachmentRecord] = {}
+chat_sessions: dict[str, ChatSessionRecord] = {}
 noop_scroll_streak = 0
 configured_provider_type = DEFAULT_PROVIDER
 configured_provider_base_url: str | None = None
@@ -186,6 +202,7 @@ class ChatRequestMessage(BaseModel):
 class ChatRequest(BaseModel):
     messages: list[ChatRequestMessage]
     attachments: list[str] = Field(default_factory=list)
+    chat_session_id: str | None = None
 
 # ── REST Endpoints ──
 
@@ -244,11 +261,15 @@ async def send_chat(req: ChatRequest):
     if not provider:
         raise HTTPException(status_code=503, detail="No provider configured.")
 
+    cleanup_expired_chat_sessions()
+
     messages_out = [ChatMessage(role=m.role, content=m.content) for m in req.messages]
 
+    merged_attachment_ids = merge_attachment_ids(req.chat_session_id, req.attachments)
+
     # Resolve attachments and inject into the last user message as multimodal content
-    if req.attachments:
-        attachment_contexts = resolve_attachment_contexts(req.attachments)
+    if merged_attachment_ids:
+        attachment_contexts = resolve_attachment_contexts(merged_attachment_ids)
         if attachment_contexts and messages_out and messages_out[-1].role == "user":
             last_text = messages_out[-1].content if isinstance(messages_out[-1].content, str) else ""
             multimodal: list[dict] = []
@@ -278,6 +299,8 @@ async def send_chat(req: ChatRequest):
                 "content": clean_content or "Sem resposta textual.",
                 "thinking": thinking_content,
             },
+            "chat_session_id": req.chat_session_id,
+            "attachments_used": merged_attachment_ids,
         }
     except Exception as e:
         logger.error(f"Chat send failed: {e}")
@@ -363,6 +386,8 @@ async def upload_attachment(file: UploadFile = File(...)):
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
 
+    preview = build_upload_preview(media_type, payload)
+
     return {
         "status": "uploaded",
         "attachment_id": attachment_id,
@@ -370,6 +395,18 @@ async def upload_attachment(file: UploadFile = File(...)):
         "media_type": media_type,
         "size": size,
         "sha256": checksum,
+        "preview": preview,
+    }
+
+
+@app.get("/uploads/capabilities")
+def upload_capabilities():
+    return {
+        "allowed_media_types": sorted(ALLOWED_MEDIA_TYPES),
+        "max_upload_bytes": MAX_UPLOAD_BYTES,
+        "max_image_bytes": MAX_IMAGE_BYTES,
+        "max_inline_image_bytes": MAX_INLINE_IMAGE_BYTES,
+        "max_attachments_per_goal": MAX_ATTACHMENTS_PER_GOAL,
     }
 
 @app.post("/planner/stop")
@@ -555,16 +592,30 @@ def resolve_attachment_contexts(attachment_ids: list[str]) -> list[dict[str, Any
 
         if item["media_type"].startswith("image/"):
             if len(payload) <= MAX_INLINE_IMAGE_BYTES:
-                encoded = base64.b64encode(payload).decode("ascii")
-                context["image_data_url"] = f"data:{item['media_type']};base64,{encoded}"
+                inline_image = normalize_inline_image_for_llm(item["media_type"], payload)
+                if inline_image:
+                    inline_media_type, inline_payload = inline_image
+                    encoded = base64.b64encode(inline_payload).decode("ascii")
+                    context["image_data_url"] = f"data:{inline_media_type};base64,{encoded}"
+                else:
+                    context["text_excerpt"] = (
+                        "Image attachment available, but inline transport conversion failed; "
+                        "use a PNG or JPEG image for direct visual analysis."
+                    )
             else:
                 context["text_excerpt"] = (
                     "Image attachment available but too large for inline context; "
                     "use website interaction tools when needed."
                 )
+        elif item["media_type"] == "application/pdf":
+            context["text_excerpt"] = extract_pdf_excerpt(payload)
+        elif item["media_type"] == "application/json":
+            context["text_excerpt"] = extract_json_excerpt(payload)
+        elif item["media_type"] == "text/csv":
+            context["text_excerpt"] = extract_csv_excerpt(payload)
         elif item["media_type"].startswith("text/"):
             try:
-                context["text_excerpt"] = payload.decode("utf-8", errors="ignore")[:4000]
+                context["text_excerpt"] = payload.decode("utf-8", errors="ignore")[:MAX_TEXT_EXCERPT_CHARS]
             except Exception:
                 pass
         else:
@@ -573,6 +624,28 @@ def resolve_attachment_contexts(attachment_ids: list[str]) -> list[dict[str, Any
         contexts.append(context)
 
     return contexts
+
+
+def normalize_inline_image_for_llm(media_type: str, payload: bytes) -> tuple[str, bytes] | None:
+    normalized_media_type = media_type.lower().strip()
+    if normalized_media_type in LLM_INLINE_NATIVE_IMAGE_MEDIA_TYPES:
+        return normalized_media_type, payload
+
+    try:
+        from PIL import Image  # type: ignore
+    except Exception:
+        logger.warning("Pillow unavailable; cannot convert %s for inline LLM transport.", media_type)
+        return None
+
+    try:
+        with Image.open(io.BytesIO(payload)) as image:
+            converted = image.convert("RGBA") if image.mode not in {"RGB", "RGBA"} else image.copy()
+            out = io.BytesIO()
+            converted.save(out, format="PNG")
+            return "image/png", out.getvalue()
+    except Exception as exc:
+        logger.warning("Inline image conversion failed for %s: %s", media_type, exc)
+        return None
 
 
 def extract_action_hint(content: str) -> str:
@@ -665,6 +738,140 @@ def cleanup_expired_attachments() -> None:
                 Path(path).unlink(missing_ok=True)
             except Exception:
                 logger.warning("Failed to remove expired attachment file: %s", path)
+
+
+def merge_attachment_ids(chat_session_id: str | None, request_attachment_ids: list[str]) -> list[str]:
+    deduped: list[str] = []
+    seen: set[str] = set()
+
+    if chat_session_id:
+        previous = chat_sessions.get(chat_session_id, {}).get("attachment_ids", [])
+        for att_id in previous:
+            if att_id not in seen:
+                deduped.append(att_id)
+                seen.add(att_id)
+
+    for att_id in request_attachment_ids:
+        if att_id not in seen:
+            deduped.append(att_id)
+            seen.add(att_id)
+
+    if chat_session_id:
+        chat_sessions[chat_session_id] = {
+            "attachment_ids": deduped,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+    return deduped
+
+
+def cleanup_expired_chat_sessions() -> None:
+    now = datetime.now(timezone.utc)
+    ttl = timedelta(hours=CHAT_SESSION_TTL_HOURS)
+    expired_ids: list[str] = []
+
+    for session_id, item in chat_sessions.items():
+        raw = item.get("updated_at")
+        try:
+            updated_at = datetime.fromisoformat(raw)
+        except Exception:
+            expired_ids.append(session_id)
+            continue
+
+        if now - updated_at > ttl:
+            expired_ids.append(session_id)
+
+    for session_id in expired_ids:
+        chat_sessions.pop(session_id, None)
+
+
+def extract_pdf_excerpt(payload: bytes) -> str:
+    try:
+        from pypdf import PdfReader  # type: ignore
+    except Exception:
+        return "PDF attachment available. Install pypdf for text extraction support."
+
+    try:
+        reader = PdfReader(io.BytesIO(payload))
+        chunks: list[str] = []
+        for page in reader.pages[:6]:
+            page_text = page.extract_text() or ""
+            if page_text.strip():
+                chunks.append(page_text.strip())
+            if sum(len(c) for c in chunks) >= MAX_TEXT_EXCERPT_CHARS:
+                break
+
+        if not chunks:
+            return "PDF attachment available, but no extractable text was found."
+        return "\n\n".join(chunks)[:MAX_TEXT_EXCERPT_CHARS]
+    except Exception:
+        return "PDF attachment available, but text extraction failed."
+
+
+def extract_json_excerpt(payload: bytes) -> str:
+    try:
+        data = json.loads(payload.decode("utf-8", errors="ignore"))
+        formatted = json.dumps(data, ensure_ascii=True, indent=2)
+        return formatted[:MAX_TEXT_EXCERPT_CHARS]
+    except Exception:
+        return payload.decode("utf-8", errors="ignore")[:MAX_TEXT_EXCERPT_CHARS]
+
+
+def extract_csv_excerpt(payload: bytes) -> str:
+    text = payload.decode("utf-8", errors="ignore")
+    lines = [line for line in text.splitlines() if line.strip()][:60]
+    if not lines:
+        return ""
+
+    reader = csv.reader(lines)
+    rendered: list[str] = []
+    for row in reader:
+        rendered.append(" | ".join(cell.strip() for cell in row))
+        if sum(len(item) for item in rendered) >= MAX_TEXT_EXCERPT_CHARS:
+            break
+
+    return "\n".join(rendered)[:MAX_TEXT_EXCERPT_CHARS]
+
+
+def build_upload_preview(media_type: str, payload: bytes) -> dict[str, Any] | None:
+    preview: dict[str, Any] = {
+        "kind": "none",
+    }
+
+    if media_type.startswith("image/"):
+        if len(payload) <= MAX_UPLOAD_PREVIEW_IMAGE_BYTES:
+            preview["kind"] = "image"
+            preview["image_data_url"] = (
+                f"data:{media_type};base64,{base64.b64encode(payload).decode('ascii')}"
+            )
+            return preview
+        preview["kind"] = "image-meta"
+        preview["text_excerpt"] = "Image too large for inline preview."
+        return preview
+
+    if media_type == "application/pdf":
+        preview["kind"] = "text"
+        preview["text_excerpt"] = extract_pdf_excerpt(payload)[:MAX_UPLOAD_PREVIEW_TEXT_CHARS]
+        return preview
+
+    if media_type == "application/json":
+        preview["kind"] = "text"
+        preview["text_excerpt"] = extract_json_excerpt(payload)[:MAX_UPLOAD_PREVIEW_TEXT_CHARS]
+        return preview
+
+    if media_type == "text/csv":
+        preview["kind"] = "text"
+        preview["text_excerpt"] = extract_csv_excerpt(payload)[:MAX_UPLOAD_PREVIEW_TEXT_CHARS]
+        return preview
+
+    if media_type.startswith("text/"):
+        preview["kind"] = "text"
+        preview["text_excerpt"] = payload.decode("utf-8", errors="ignore")[:MAX_UPLOAD_PREVIEW_TEXT_CHARS]
+        return preview
+
+    preview["kind"] = "binary"
+    preview["text_excerpt"] = "Binary file uploaded."
+    return preview
 
 
 # ── Entry point ──
