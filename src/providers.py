@@ -14,6 +14,7 @@ Implementações:
 
 from __future__ import annotations
 
+import base64
 import httpx
 from dataclasses import dataclass, field
 from typing import Protocol, Any, runtime_checkable
@@ -116,15 +117,37 @@ class OpenAICompatibleProvider:
             data = resp.json()
         except httpx.HTTPStatusError as err:
             if self._contains_multimodal_messages(messages):
-                # Fallback: model rejected multimodal → retry as text-only (with tools)
-                fallback_payload = self._build_payload(
-                    messages=self._to_text_only_messages(messages),
-                    model=model,
-                    tools=tools,
-                )
-                fallback_resp = await self._client.post("/v1/chat/completions", json=fallback_payload)
-                fallback_resp.raise_for_status()
-                data = fallback_resp.json()
+                # Retry 1: alternate multimodal format for providers that reject image_url style.
+                try:
+                    alt_payload = self._build_payload(
+                        messages=self._to_alternate_multimodal_messages(messages),
+                        model=model,
+                        tools=tools,
+                    )
+                    alt_resp = await self._client.post("/v1/chat/completions", json=alt_payload)
+                    alt_resp.raise_for_status()
+                    data = alt_resp.json()
+                except httpx.HTTPStatusError:
+                    # Retry 2: flat image_url format for providers expecting image_url as string.
+                    try:
+                        flat_payload = self._build_payload(
+                            messages=self._to_flat_image_url_messages(messages),
+                            model=model,
+                            tools=tools,
+                        )
+                        flat_resp = await self._client.post("/v1/chat/completions", json=flat_payload)
+                        flat_resp.raise_for_status()
+                        data = flat_resp.json()
+                    except httpx.HTTPStatusError:
+                        # Retry 3: force text-only fallback while preserving tool-call contract.
+                        fallback_payload = self._build_payload(
+                            messages=self._to_text_only_messages(messages),
+                            model=model,
+                            tools=tools,
+                        )
+                        fallback_resp = await self._client.post("/v1/chat/completions", json=fallback_payload)
+                        fallback_resp.raise_for_status()
+                        data = fallback_resp.json()
             elif tools:
                 # Fallback: model rejected tool-calling format → retry without tools
                 notool_payload = self._build_payload(messages=messages, model=model, tools=None)
@@ -218,6 +241,104 @@ class OpenAICompatibleProvider:
             )
 
         return normalized
+
+    def _to_alternate_multimodal_messages(self, messages: list[ChatMessage]) -> list[ChatMessage]:
+        normalized: list[ChatMessage] = []
+
+        for msg in messages:
+            if not isinstance(msg.content, list):
+                normalized.append(msg)
+                continue
+
+            parts_out: list[dict[str, Any]] = []
+            for part in msg.content:
+                if not isinstance(part, dict):
+                    parts_out.append({"type": "text", "text": str(part)})
+                    continue
+
+                part_type = part.get("type")
+                if part_type == "image_url":
+                    image_url = part.get("image_url", {}).get("url")
+                    transformed = self._data_url_to_base64_image_part(image_url)
+                    if transformed:
+                        parts_out.append(transformed)
+                    else:
+                        parts_out.append({"type": "text", "text": "[image attachment omitted: unsupported image URL format]"})
+                    continue
+
+                parts_out.append(part)
+
+            normalized.append(
+                ChatMessage(
+                    role=msg.role,
+                    content=parts_out,
+                    tool_call_id=msg.tool_call_id,
+                    tool_calls=msg.tool_calls,
+                )
+            )
+
+        return normalized
+
+    def _to_flat_image_url_messages(self, messages: list[ChatMessage]) -> list[ChatMessage]:
+        normalized: list[ChatMessage] = []
+
+        for msg in messages:
+            if not isinstance(msg.content, list):
+                normalized.append(msg)
+                continue
+
+            parts_out: list[dict[str, Any]] = []
+            for part in msg.content:
+                if not isinstance(part, dict):
+                    parts_out.append({"type": "text", "text": str(part)})
+                    continue
+
+                part_type = part.get("type")
+                if part_type == "image_url":
+                    image_url = part.get("image_url", {}).get("url")
+                    if isinstance(image_url, str) and image_url:
+                        parts_out.append({"type": "image_url", "image_url": image_url})
+                    else:
+                        parts_out.append({"type": "text", "text": "[image attachment omitted: invalid image URL]"})
+                    continue
+
+                parts_out.append(part)
+
+            normalized.append(
+                ChatMessage(
+                    role=msg.role,
+                    content=parts_out,
+                    tool_call_id=msg.tool_call_id,
+                    tool_calls=msg.tool_calls,
+                )
+            )
+
+        return normalized
+
+    def _data_url_to_base64_image_part(self, url: Any) -> dict[str, Any] | None:
+        if not isinstance(url, str) or not url.startswith("data:"):
+            return None
+
+        header, _, encoded = url.partition(",")
+        if ";base64" not in header or not encoded:
+            return None
+
+        media_type = header[5:].split(";", maxsplit=1)[0] or "image/png"
+
+        try:
+            # Validate base64 before forwarding to provider
+            base64.b64decode(encoded, validate=True)
+        except Exception:
+            return None
+
+        return {
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": media_type,
+                "data": encoded,
+            },
+        }
 
 
 # ── LM Studio ──
